@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/
+.npm-cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Data (mounted as volumes at runtime)
+data/
+docker/volumes/
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# Temp
+*.tmp
+*.log

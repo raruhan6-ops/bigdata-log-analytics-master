@@ -1,0 +1,350 @@
+# =============================================================================
+# 大数据离线日志分析平台 — Docker 全集群部署
+#
+# 启动: docker-compose up -d
+# 停止: docker-compose down
+# 查看: docker-compose ps
+#
+# 架构分层（13 个容器）:
+#   采集层: flume（日志 → Kafka）
+#   消息层: zookeeper, kafka
+#   存储层: namenode, datanode1, datanode2 (HDFS)
+#   计算层: spark-master, spark-worker
+#   仓库层: hive-metastore, hive-server2
+#   应用层: mysql, backend (FastAPI), frontend (Nginx + Vue)
+#
+# 内存建议: Docker Desktop 分配 ≥ 8 GB
+# =============================================================================
+services:
+
+  # ========================================================================
+  #  消息层
+  # ========================================================================
+
+  # ---------- Zookeeper（Kafka 依赖）----------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.12
+    container_name: log_zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    networks:
+      - log_network
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo srvr | nc -w 1 localhost 2181 | grep Mode"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------- Kafka 消息队列 ----------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.12
+    container_name: log_kafka
+    ports:
+      - "9092:9092"   # 宿主机访问
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    networks:
+      - log_network
+    healthcheck:
+      test: ["CMD", "bash", "-c", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ========================================================================
+  #  存储层 — HDFS（1 NameNode + 2 DataNode）
+  # ========================================================================
+
+  # ---------- NameNode（HDFS 元数据管理）----------
+  namenode:
+    image: apache/hadoop:3
+    container_name: log_namenode
+    user: root
+    ports:
+      - "9870:9870"   # Web UI
+      - "9000:9000"   # IPC
+    environment:
+      - HADOOP_HOME=/opt/hadoop
+      - HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
+    volumes:
+      - ./hadoop/conf/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hadoop/conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+      - ./hadoop/entrypoint/namenode.sh:/entrypoint.sh:ro
+      - namenode_data:/data/hdfs/namenode
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    networks:
+      - log_network
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:9870"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  # ---------- DataNode 1 ----------
+  datanode1:
+    image: apache/hadoop:3
+    container_name: log_datanode1
+    user: root
+    ports:
+      - "9864:9864"   # Web UI
+    environment:
+      - HADOOP_HOME=/opt/hadoop
+      - HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
+      - NAMENODE_HOST=namenode
+    volumes:
+      - ./hadoop/conf/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hadoop/conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+      - ./hadoop/entrypoint/datanode.sh:/entrypoint.sh:ro
+      - datanode1_data:/data/hdfs/datanode
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    depends_on:
+      namenode:
+        condition: service_healthy
+    networks:
+      - log_network
+
+  # ---------- DataNode 2 ----------
+  datanode2:
+    image: apache/hadoop:3
+    container_name: log_datanode2
+    user: root
+    environment:
+      - HADOOP_HOME=/opt/hadoop
+      - HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop
+      - NAMENODE_HOST=namenode
+    volumes:
+      - ./hadoop/conf/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hadoop/conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+      - ./hadoop/entrypoint/datanode.sh:/entrypoint.sh:ro
+      - datanode2_data:/data/hdfs/datanode
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    depends_on:
+      namenode:
+        condition: service_healthy
+    networks:
+      - log_network
+
+  # ========================================================================
+  #  计算层 — Spark Standalone
+  # ========================================================================
+
+  # ---------- Spark Master ----------
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: log_spark_master
+    ports:
+      - "8080:8080"   # Web UI
+      - "7077:7077"   # Cluster port
+    environment:
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_HOME=/opt/spark
+    volumes:
+      - ./hadoop/conf/core-site.xml:/opt/spark/conf/core-site.xml:ro
+      - ./hadoop/conf/hdfs-site.xml:/opt/spark/conf/hdfs-site.xml:ro
+      - spark_data:/opt/spark/work
+      - ./data-warehouse:/opt/spark/data-warehouse:ro
+      - ./scripts:/opt/spark/scripts:ro
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    networks:
+      - log_network
+    healthcheck:
+      test: ["CMD", "curl", "-s", "http://localhost:8080"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ---------- Spark Worker ----------
+  spark-worker:
+    image: apache/spark:3.5.0
+    container_name: log_spark_worker
+    ports:
+      - "8081:8081"   # Worker Web UI
+    environment:
+      - SPARK_HOME=/opt/spark
+    volumes:
+      - ./hadoop/conf/core-site.xml:/opt/spark/conf/core-site.xml:ro
+      - ./hadoop/conf/hdfs-site.xml:/opt/spark/conf/hdfs-site.xml:ro
+      - spark_worker_data:/opt/spark/work
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    networks:
+      - log_network
+
+  # ========================================================================
+  #  仓库层 — Hive（Metastore + Server2）
+  # ========================================================================
+
+  # ---------- Hive Metastore ----------
+  hive-metastore:
+    image: apache/hive:4.0.0
+    container_name: log_hive_metastore
+    user: root
+    ports:
+      - "9083:9083"   # Thrift
+    environment:
+      SERVICE_NAME: metastore
+      HADOOP_CONF_DIR: /opt/hadoop-conf
+    volumes:
+      - ./hadoop/conf/core-site.xml:/opt/hadoop-conf/core-site.xml:ro
+      - ./hadoop/conf/hdfs-site.xml:/opt/hadoop-conf/hdfs-site.xml:ro
+    depends_on:
+      namenode:
+        condition: service_healthy
+    networks:
+      - log_network
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9083 && echo ok || echo fail"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
+
+  # ---------- Hive Server2（SQL 查询入口）----------
+  hive-server2:
+    image: apache/hive:4.0.0
+    container_name: log_hive_server2
+    user: root
+    ports:
+      - "10000:10000" # Thrift JDBC
+      - "10002:10002" # Web UI
+    environment:
+      SERVICE_NAME: hiveserver2
+      HADOOP_CONF_DIR: /opt/hadoop-conf
+    volumes:
+      - ./hadoop/conf/core-site.xml:/opt/hadoop-conf/core-site.xml:ro
+      - ./hadoop/conf/hdfs-site.xml:/opt/hadoop-conf/hdfs-site.xml:ro
+      - ./data-warehouse:/opt/data-warehouse:ro
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    networks:
+      - log_network
+
+  # ========================================================================
+  #  采集层 — Flume
+  # ========================================================================
+
+  # ---------- Flume Agent（taildir → Kafka + Kafka → HDFS）----------
+  flume:
+    build:
+      context: .
+      dockerfile: docker/flume/Dockerfile
+    container_name: log_flume
+    environment:
+      FLUME_AGENT_NAME: a1
+      FLUME_CONF_FILE: /opt/flume/conf/taildir-kafka.conf
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["sleep infinity"]
+    volumes:
+      - ./data/logs:/data/logs:ro               # 读宿主机日志
+      - ./flume/taildir-kafka.conf:/opt/flume/conf/taildir-kafka.conf:ro
+      - ./flume/kafka-hdfs.conf:/opt/flume/conf/kafka-hdfs.conf:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    networks:
+      - log_network
+
+  # ========================================================================
+  #  应用层 — MySQL + Backend + Frontend
+  # ========================================================================
+
+  # ---------- MySQL 8.0 ----------
+  mysql:
+    image: mysql:8.0
+    container_name: log_mysql
+    ports:
+      - "3307:3306"   # 宿主机用 3307，容器内 3306
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456"
+      MYSQL_DATABASE: log_analytics
+      MYSQL_USER: loguser
+      MYSQL_PASSWORD: logpass123
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - log_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p123456"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  # ---------- FastAPI 后端 ----------
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: log_backend
+    ports:
+      - "8001:8000"
+    environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=loguser
+      - MYSQL_PASSWORD=logpass123
+      - MYSQL_DATABASE=log_analytics
+    volumes:
+      - ./data:/app/data:ro
+      - ./backend/app:/app/app:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - log_network
+
+  # ---------- Vue3 前端 ----------
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+    container_name: log_frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    networks:
+      - log_network
+
+# ============================================================================
+#  持久化卷
+# ============================================================================
+volumes:
+  zookeeper_data:
+  zookeeper_logs:
+  kafka_data:
+  mysql_data:
+  namenode_data:
+  datanode1_data:
+  datanode2_data:
+  spark_data:
+  spark_worker_data:
+
+# ============================================================================
+#  网络
+# ============================================================================
+networks:
+  log_network:
+    driver: bridge
+    name: log_network
